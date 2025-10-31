@@ -6,8 +6,10 @@ const { PDFDocument, rgb, StandardFonts, PDFName, PDFString } = require('pdf-lib
 async function createFormFieldsOCR(pdfBuffer, fillableAreas) {
   const pdfDoc = await PDFDocument.load(pdfBuffer);
   const pages = pdfDoc.getPages();
-  const helveticaFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
   const form = pdfDoc.getForm();
+  
+  // ❌ 移除這行！會導致字體問題
+  // const helveticaFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
   
   let successCount = 0;
   let errorCount = 0;
@@ -33,11 +35,13 @@ async function createFormFieldsOCR(pdfBuffer, fillableAreas) {
       const textField = form.createTextField(area.field_name);
       textField.setText('');
       
+      // ✅ 簡化字體設置 - 不嵌入字體
       const fontSize = Math.max(8, Math.min(safeHeight * 0.6, 12));
       
-      const acroField = textField.acroField;
-      const defaultAppearance = `0 0 0 rg /Helv ${fontSize} Tf`;
-      acroField.dict.set(PDFName.of('DA'), PDFString.of(defaultAppearance));
+      // ❌ 移除複雜的字體設置
+      // const acroField = textField.acroField;
+      // const defaultAppearance = `0 0 0 rg /Helv ${fontSize} Tf`;
+      // acroField.dict.set(PDFName.of('DA'), PDFString.of(defaultAppearance));
       
       // 根據類型設置顏色
       let borderColor, backgroundColor;
@@ -63,22 +67,34 @@ async function createFormFieldsOCR(pdfBuffer, fillableAreas) {
         backgroundColor: backgroundColor,
       });
       
-      try {
-        textField.updateAppearances(helveticaFont);
-      } catch (e) {
-        // 忽略外觀更新錯誤
-      }
+      // ❌ 移除字體更新
+      // try {
+      //   textField.updateAppearances(helveticaFont);
+      // } catch (e) {
+      //   // 忽略外觀更新錯誤
+      // }
       
       successCount++;
+      
+      if (successCount % 20 === 0) {
+        console.log(`  Created ${successCount}/${fillableAreas.length} fields`);
+      }
       
     } catch (error) {
       errorCount++;
       errors.push(`${area.field_name}: ${error.message}`);
-      console.error(`✗ ${area.field_name}: ${error.message}`);
+      console.error(`  ✗ ${area.field_name}: ${error.message}`);
     }
   }
   
-  const pdfBytes = await pdfDoc.save();
+  console.log(`\n✓ Completed: ${successCount} created, ${errorCount} errors`);
+  
+  // ✅ 使用基本保存選項
+  const pdfBytes = await pdfDoc.save({
+    useObjectStreams: false,  // 兼容性更好
+    addDefaultPage: false
+  });
+  
   const base64Pdf = Buffer.from(pdfBytes).toString('base64');
   
   const fieldStats = {
