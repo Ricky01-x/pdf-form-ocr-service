@@ -15,19 +15,15 @@ app.use(express.json({ limit: '50mb' }));
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
-    service: 'PDF Form Generator - Hybrid OCR Method',
-    version: '2.0.0',
-    method: 'Text-Guided Regional Line Detection',
+    service: 'PDF Form Generator - Triple Detection',
+    version: '3.0.0',
+    method: 'Three-Layer Detection System',
     features: [
-      'Adobe Extract text analysis',
-      'Regional image cropping',
-      'Precise line detection in text regions',
-      'No false positives from logos'
-    ],
-    endpoints: {
-      health: 'GET /',
-      process: 'POST /process-ocr'
-    }
+      'Layer 1: Text underscore detection',
+      'Layer 2: Long space detection',
+      'Layer 3: Targeted region scanning',
+      'Multiple lines per text block support'
+    ]
   });
 });
 
@@ -41,15 +37,8 @@ app.post('/process-ocr', async (req, res) => {
       return res.status(400).json({ success: false, error: 'pdf_url is required' });
     }
     
-    if (!extract_elements || !Array.isArray(extract_elements)) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'extract_elements array is required for text-guided detection' 
-      });
-    }
-    
     logger.info('='.repeat(60));
-    logger.info('Hybrid OCR Processing Started');
+    logger.info('Triple Detection Processing Started');
     logger.info(`PDF URL: ${pdf_url}`);
     logger.info('='.repeat(60));
     
@@ -62,108 +51,143 @@ app.post('/process-ocr', async (req, res) => {
     const pdfBuffer = Buffer.from(await pdfResponse.arrayBuffer());
     logger.info(`✓ PDF downloaded: ${(pdfBuffer.length / 1024).toFixed(2)} KB`);
     
-    // Step 2: 從 Adobe Extract 找出包含下劃線的文字區域
-    logger.info('\n[Step 2] Analyzing text elements for underscores...');
-    const regionsWithUnderscores = findRegionsWithUnderscores(extract_elements);
-    logger.info(`✓ Found ${regionsWithUnderscores.length} text regions with underscores`);
+    // Step 2: 分析文字元素，找出可能的填答區域
+    logger.info('\n[Step 2] Analyzing text elements...');
+    const targetRegions = analyzeTextElements(extract_elements || []);
     
-    if (regionsWithUnderscores.length === 0) {
-      logger.info('⚠ No underscores found in text, falling back to full-page scan');
-    }
+    logger.info(`✓ Found ${targetRegions.underscores} regions with underscores`);
+    logger.info(`✓ Found ${targetRegions.longSpaces} regions with long spaces`);
+    logger.info(`✓ Total target regions: ${targetRegions.all.length}`);
     
-    // Step 3: PDF → 圖片（全頁）
+    // Step 3: PDF → 圖片
     logger.info('\n[Step 3] Converting PDF to images...');
     const dpi = options.dpi || 300;
     const images = await convertPDFToImages(pdfBuffer, { dpi });
     logger.info(`✓ Converted ${images.length} pages to images (${dpi} DPI)`);
     
-    // Step 4: 載入 PDF 獲取頁面尺寸
-    const { PDFDocument } = require('pdf-lib');
-    const pdfDoc = await PDFDocument.load(pdfBuffer);
-    const pdfPages = pdfDoc.getPages();
-    
-    // Step 5: 對每個包含下劃線的區域進行精確檢測
-    logger.info('\n[Step 4] Detecting lines in text regions...');
+    // Step 4: 精準掃描目標區域
+    logger.info('\n[Step 4] Scanning target regions...');
     const fillableAreas = [];
     let fieldIndex = 1;
     let totalLinesDetected = 0;
     
-    for (const region of regionsWithUnderscores) {
-      const pageImage = images[region.page];
-      if (!pageImage) continue;
+    const { PDFDocument } = require('pdf-lib');
+    const pdfDoc = await PDFDocument.load(pdfBuffer);
+    const pages = pdfDoc.getPages();
+    
+    // 按頁面分組
+    const regionsByPage = {};
+    for (const region of targetRegions.all) {
+      const page = region.page;
+      if (!regionsByPage[page]) {
+        regionsByPage[page] = [];
+      }
+      regionsByPage[page].push(region);
+    }
+    
+    for (const pageIndex of Object.keys(regionsByPage).map(Number)) {
+      const regions = regionsByPage[pageIndex];
+      const image = images[pageIndex];
       
-      const pdfPage = pdfPages[region.page];
-      if (!pdfPage) continue;
+      if (!image) {
+        logger.info(`  ⚠ Page ${pageIndex} image not found, skipping`);
+        continue;
+      }
       
+      const pdfPage = pages[pageIndex];
       const pdfPageWidth = pdfPage.getWidth();
       const pdfPageHeight = pdfPage.getHeight();
       
-      // 將 PDF 座標轉換為圖片像素座標
-      const imageRegion = pdfBoundsToImageBounds(
-        region.bounds,
-        pageImage.width,
-        pageImage.height,
-        pdfPageWidth,
-        pdfPageHeight
-      );
+      logger.info(`\n  Page ${pageIndex + 1}: ${regions.length} regions to scan`);
       
-      logger.info(`  Page ${region.page + 1}, Region: "${region.text.substring(0, 50)}..."`);
-      logger.info(`    PDF Bounds: [${region.bounds.map(b => b.toFixed(0)).join(', ')}]`);
-      logger.info(`    Image Region: [${imageRegion.map(b => b.toFixed(0)).join(', ')}]`);
-      
-      // 在該區域中檢測橫線
-      const lines = await detectHorizontalLinesInRegion(
-        pageImage.buffer,
-        imageRegion,
-        {
-          minLength: options.minLineLength || 20,
-          maxThickness: options.maxThickness || 3,
-          threshold: options.threshold || 50
-        }
-      );
-      
-      logger.info(`    ✓ Detected ${lines.length} lines in this region`);
-      totalLinesDetected += lines.length;
-      
-      // 轉換回 PDF 座標並創建欄位
-      for (const line of lines) {
-        const pdfCoords = pixelToPDFCoordinates(
-          line.startX,
-          line.y,
-          pageImage.width,
-          pageImage.height,
-          pdfPageWidth,
-          pdfPageHeight
+      for (const region of regions) {
+        const bounds = region.bounds;
+        const text = region.text;
+        const expectedLines = region.expectedLines;
+        
+        // 計算像素座標
+        const scaleX = image.width / pdfPageWidth;
+        const scaleY = image.height / pdfPageHeight;
+        
+        const pixelX1 = Math.floor(bounds[0] * scaleX);
+        const pixelY1 = Math.floor((pdfPageHeight - bounds[3]) * scaleY);
+        const pixelX2 = Math.ceil(bounds[2] * scaleX);
+        const pixelY2 = Math.ceil((pdfPageHeight - bounds[1]) * scaleY);
+        
+        // 加 padding
+        const padding = 15;
+        const safeX1 = Math.max(0, pixelX1 - padding);
+        const safeY1 = Math.max(0, pixelY1 - padding);
+        const safeX2 = Math.min(image.width, pixelX2 + padding);
+        const safeY2 = Math.min(image.height, pixelY2 + padding);
+        
+        logger.info(`    Region (${region.type}): "${text.substring(0, 60)}..."`);
+        logger.info(`      Expected lines: ${expectedLines}`);
+        logger.info(`      Pixel region: [${safeX1}, ${safeY1}, ${safeX2}, ${safeY2}]`);
+        
+        // 在區域內檢測橫線
+        const lines = await detectHorizontalLinesInRegion(
+          image.buffer,
+          image.width,
+          image.height,
+          {
+            x: safeX1,
+            y: safeY1,
+            width: safeX2 - safeX1,
+            height: safeY2 - safeY1
+          },
+          {
+            minLength: options.minLineLength || 15,
+            maxThickness: options.maxThickness || 3,
+            threshold: options.threshold || 50
+          }
         );
         
-        const lineWidthInPDF = (line.length / pageImage.width) * pdfPageWidth;
+        logger.info(`      ✓ Found ${lines.length} lines (expected ${expectedLines})`);
         
-        // 根據文字內容猜測欄位類型
-        const fieldType = guessFieldType(region.text);
+        // 如果檢測到的線少於預期，警告
+        if (lines.length < expectedLines) {
+          logger.info(`      ⚠ Detected fewer lines than expected!`);
+        }
         
-        fillableAreas.push({
-          id: fieldIndex,
-          field_name: `${fieldType}_${fieldIndex}`,
-          page: region.page,
-          x: pdfCoords.x,
-          y: pdfCoords.y - 2,
-          width: lineWidthInPDF,
-          height: 15,
-          field_type: fieldType,
-          metadata: {
-            textContext: region.text.substring(0, 100),
-            detectionMethod: 'regional'
-          }
-        });
+        totalLinesDetected += lines.length;
         
-        fieldIndex++;
+        // 轉換為 PDF 座標並創建欄位
+        for (const line of lines) {
+          const absolutePixelX = safeX1 + line.startX;
+          const absolutePixelY = safeY1 + line.y;
+          
+          const pdfX = absolutePixelX / scaleX;
+          const pdfY = pdfPageHeight - (absolutePixelY / scaleY);
+          const pdfWidth = line.length / scaleX;
+          
+          const fieldType = guessFieldType(text);
+          
+          fillableAreas.push({
+            id: fieldIndex,
+            field_name: `${fieldType}_${fieldIndex}`,
+            page: pageIndex,
+            x: pdfX,
+            y: pdfY - 2,
+            width: pdfWidth,
+            height: 15,
+            field_type: fieldType,
+            metadata: {
+              sourceText: text.substring(0, 100),
+              detectionType: region.type,
+              expectedLines: expectedLines
+            }
+          });
+          
+          fieldIndex++;
+        }
       }
     }
     
     logger.info(`\n✓ Total lines detected: ${totalLinesDetected}`);
-    logger.info(`✓ Total fields created: ${fillableAreas.length}`);
+    logger.info(`✓ Total field definitions: ${fillableAreas.length}`);
     
-    // Step 6: 創建表單欄位
+    // Step 5: 創建表單欄位
     logger.info('\n[Step 5] Creating form fields in PDF...');
     const { pdf_base64, statistics, errors } = await createFormFieldsOCR(
       pdfBuffer, 
@@ -173,7 +197,7 @@ app.post('/process-ocr', async (req, res) => {
     const processingTime = ((Date.now() - startTime) / 1000).toFixed(2);
     
     logger.info('\n' + '='.repeat(60));
-    logger.info('Hybrid OCR Processing Completed');
+    logger.info('Triple Detection Processing Completed');
     logger.info(`Total time: ${processingTime}s`);
     logger.info(`Fields created: ${statistics.created_fields}/${statistics.detected_areas}`);
     logger.info(`Errors: ${statistics.errors}`);
@@ -181,13 +205,13 @@ app.post('/process-ocr', async (req, res) => {
     
     res.json({
       success: true,
-      method: 'hybrid-regional',
+      method: 'triple-detection',
       pdf_base64: pdf_base64,
       statistics: {
         ...statistics,
         processing_time_seconds: parseFloat(processingTime),
         pages_processed: images.length,
-        text_regions_analyzed: regionsWithUnderscores.length,
+        regions_scanned: targetRegions.all.length,
         lines_detected: totalLinesDetected
       },
       fields: fillableAreas.map(area => ({
@@ -195,6 +219,7 @@ app.post('/process-ocr', async (req, res) => {
         name: area.field_name,
         type: area.field_type,
         page: area.page,
+        source: area.metadata.detectionType,
         coordinates: {
           x: area.x.toFixed(2),
           y: area.y.toFixed(2),
@@ -215,78 +240,118 @@ app.post('/process-ocr', async (req, res) => {
 });
 
 /**
- * 從 Adobe Extract 元素中找出包含下劃線的區域
+ * 分析文字元素，找出所有可能的填答區域
  */
-function findRegionsWithUnderscores(elements) {
+function analyzeTextElements(elements) {
   const regions = [];
+  let underscoreCount = 0;
+  let longSpaceCount = 0;
   
   for (const element of elements) {
     if (!element.Text || !element.Bounds) continue;
     
     const text = element.Text;
+    const bounds = element.Bounds;
+    const page = element.Page || 0;
     
-    // 檢查是否包含至少 3 個連續下劃線
-    if (hasUnderscores(text, 3)) {
+    // 檢測 1: 下劃線字符 "___"
+    const underscoreSegments = findUnderscoreSegments(text);
+    if (underscoreSegments.length > 0) {
       regions.push({
-        page: element.Page || 0,
+        type: 'underscore',
+        page: page,
+        bounds: bounds,
         text: text,
-        bounds: element.Bounds, // [x1, y1, x2, y2]
-        font: element.Font
+        expectedLines: underscoreSegments.length,
+        segments: underscoreSegments
+      });
+      underscoreCount++;
+    }
+    
+    // 檢測 2: 異常長的空格（可能是填答框）
+    const longSpaceSegments = findLongSpaceSegments(text);
+    if (longSpaceSegments.length > 0) {
+      regions.push({
+        type: 'long-space',
+        page: page,
+        bounds: bounds,
+        text: text,
+        expectedLines: longSpaceSegments.length,
+        segments: longSpaceSegments
+      });
+      longSpaceCount++;
+    }
+    
+    // 檢測 3: 特殊模式（例如 "at:" 後面通常有填答框）
+    if (hasFillingPattern(text)) {
+      regions.push({
+        type: 'pattern',
+        page: page,
+        bounds: bounds,
+        text: text,
+        expectedLines: 1,
+        segments: []
       });
     }
   }
   
-  return regions;
+  return {
+    all: regions,
+    underscores: underscoreCount,
+    longSpaces: longSpaceCount
+  };
 }
 
 /**
- * 檢查文字是否包含連續下劃線
+ * 找出文字中的下劃線段落
  */
-function hasUnderscores(text, minCount = 3) {
-  let maxConsecutive = 0;
-  let currentCount = 0;
+function findUnderscoreSegments(text) {
+  const segments = [];
+  const regex = /_{3,}/g; // 至少 3 個連續下劃線
+  let match;
   
-  for (let i = 0; i < text.length; i++) {
-    if (text[i] === '_') {
-      currentCount++;
-      maxConsecutive = Math.max(maxConsecutive, currentCount);
-    } else if (text[i] !== ' ') { // 允許空格
-      currentCount = 0;
-    }
+  while ((match = regex.exec(text)) !== null) {
+    segments.push({
+      start: match.index,
+      end: match.index + match[0].length,
+      length: match[0].length
+    });
   }
   
-  return maxConsecutive >= minCount;
+  return segments;
 }
 
 /**
- * 將 PDF 座標轉換為圖片像素座標
+ * 找出異常長的空格（可能是填答框）
  */
-function pdfBoundsToImageBounds(pdfBounds, imageWidth, imageHeight, pdfPageWidth, pdfPageHeight) {
-  // pdfBounds: [x1, y1, x2, y2] (PDF 座標，原點左下)
-  // 返回: [x1, y1, x2, y2] (圖片座標，原點左上)
+function findLongSpaceSegments(text) {
+  const segments = [];
+  const regex = / {8,}/g; // 至少 8 個連續空格
+  let match;
   
-  const scaleX = imageWidth / pdfPageWidth;
-  const scaleY = imageHeight / pdfPageHeight;
+  while ((match = regex.exec(text)) !== null) {
+    segments.push({
+      start: match.index,
+      end: match.index + match[0].length,
+      length: match[0].length
+    });
+  }
   
-  const x1 = pdfBounds[0] * scaleX;
-  const y1 = imageHeight - (pdfBounds[3] * scaleY); // 翻轉 Y 軸
-  const x2 = pdfBounds[2] * scaleX;
-  const y2 = imageHeight - (pdfBounds[1] * scaleY); // 翻轉 Y 軸
-  
-  // 添加邊距（上下各 20 像素，左右各 10 像素）
-  const padding = {
-    top: 20,
-    bottom: 20,
-    left: 10,
-    right: 10
-  };
-  
-  return [
-    Math.max(0, x1 - padding.left),
-    Math.max(0, y1 - padding.top),
-    Math.min(imageWidth, x2 + padding.right),
-    Math.min(imageHeight, y2 + padding.bottom)
+  return segments;
+}
+
+/**
+ * 檢測特殊填答模式
+ */
+function hasFillingPattern(text) {
+  const patterns = [
+    /at:\s*$/i,           // "located at:" 後面
+    /of \$\s*\./i,        // "sum of $ ." 格式
+    /amount of \$\s*$/i,  // "amount of $" 後面
+    /company:\s*\./i      // "company: ." 格式
   ];
+  
+  return patterns.some(pattern => pattern.test(text));
 }
 
 /**
@@ -304,15 +369,18 @@ function guessFieldType(text) {
     return 'currency';
   }
   
+  if (lower.includes('date')) {
+    return 'date';
+  }
+  
   return 'text';
 }
 
 app.listen(PORT, () => {
   logger.info(`\n${'='.repeat(60)}`);
-  logger.info(`PDF Form Generator - Hybrid OCR Method`);
-  logger.info(`Version: 2.0.0`);
+  logger.info(`PDF Form Generator - Triple Detection`);
+  logger.info(`Version: 3.0.0`);
   logger.info(`Running on http://localhost:${PORT}`);
-  logger.info(`Method: Text-Guided Regional Line Detection`);
   logger.info(`${'='.repeat(60)}\n`);
 });
 
