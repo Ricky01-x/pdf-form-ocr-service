@@ -1,10 +1,10 @@
 const express = require('express');
 const cors = require('cors');
-const { convertPDFToImages } = require('./services/pdfToImage');
-const { detectHorizontalLines } = require('./services/lineDetector');
-const { pixelToPDFCoordinates } = require('./services/coordinateMapper');
-const { createFormFieldsOCR } = require('./services/formCreator');
-const logger = require('./utils/logger');
+const { convertPDFToImages } = require('./pdfToImage');
+const { detectHorizontalLines } = require('./lineDetector');
+const { pixelToPDFCoordinates } = require('./coordinateMapper');
+const { createFormFieldsOCR } = require('./formCreator');
+const logger = require('./logger');
 
 const app = express();
 const PORT = process.env.PORT || 3002;
